@@ -515,9 +515,6 @@ module Puma
         status, headers, res_body = lowlevel_error(e, client.env, 400)
         write_response(status, headers, res_body, buffer, requests, client)
         @events.parse_error e, client
-      when HttpParserError501
-        client.write_error(501)
-        @events.parse_error e, client
       else
         status, headers, res_body = lowlevel_error(e, client.env)
         write_response(status, headers, res_body, buffer, requests, client)
