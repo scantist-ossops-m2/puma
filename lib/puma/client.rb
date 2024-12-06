@@ -23,6 +23,8 @@ module Puma
 
   class ConnectionError < RuntimeError; end
 
+  class HttpParserError501 < IOError; end
+
   # An instance of this class represents a unique request from a client.
   # For example, this could be a web request from a browser or from CURL.
   #
@@ -35,7 +37,30 @@ module Puma
   # Instances of this class are responsible for knowing if
   # the header and body are fully buffered via the `try_to_finish` method.
   # They can be used to "time out" a response via the `timeout_at` reader.
+  #
   class Client
+
+    # this tests all values but the last, which must be chunked
+    ALLOWED_TRANSFER_ENCODING = %w[compress deflate gzip].freeze
+
+    # chunked body validation
+    CHUNK_SIZE_INVALID = /[^\h]/.freeze
+    CHUNK_VALID_ENDING = Const::LINE_END
+    CHUNK_VALID_ENDING_SIZE = CHUNK_VALID_ENDING.bytesize
+
+    # The maximum number of bytes we'll buffer looking for a valid
+    # chunk header.
+    MAX_CHUNK_HEADER_SIZE = 4096
+
+    # The maximum amount of excess data the client sends
+    # using chunk size extensions before we abort the connection.
+    MAX_CHUNK_EXCESS = 16 * 1024
+
+    # Content-Length header value validation
+    CONTENT_LENGTH_VALUE_INVALID = /[^\d]/.freeze
+
+    TE_ERR_MSG = 'Invalid Transfer-Encoding'
+
     # The object used for a request with no body. All requests with
     # no body share this one object since it has no state.
     EmptyBody = NullIO.new
@@ -302,16 +327,27 @@ module Puma
       body = @parser.body
 
       te = @env[TRANSFER_ENCODING2]
-
       if te
-        if te.include?(",")
-          te.split(",").each do |part|
-            if CHUNKED.casecmp(part.strip) == 0
-              return setup_chunked_body(body)
-            end
+        te_lwr = te.downcase
+        if te.include? ','
+          te_ary = te_lwr.split ','
+          te_count = te_ary.count CHUNKED
+          te_valid = te_ary[0..-2].all? { |e| ALLOWED_TRANSFER_ENCODING.include? e }
+          if te_ary.last == CHUNKED && te_count == 1 && te_valid
+            @env.delete TRANSFER_ENCODING2
+            return setup_chunked_body body
+          elsif te_count >= 1
+            raise HttpParserError   , "#{TE_ERR_MSG}, multiple chunked: '#{te}'"
+          elsif !te_valid
+            raise HttpParserError501, "#{TE_ERR_MSG}, unknown value: '#{te}'"
           end
-        elsif CHUNKED.casecmp(te) == 0
-          return setup_chunked_body(body)
+        elsif te_lwr == CHUNKED
+          @env.delete TRANSFER_ENCODING2
+          return setup_chunked_body body
+        elsif ALLOWED_TRANSFER_ENCODING.include? te_lwr
+          raise HttpParserError     , "#{TE_ERR_MSG}, single value must be chunked: '#{te}'"
+        else
+          raise HttpParserError501  , "#{TE_ERR_MSG}, unknown value: '#{te}'"
         end
       end
 
@@ -319,7 +355,12 @@ module Puma
 
       cl = @env[CONTENT_LENGTH]
 
-      unless cl
+      if cl
+        # cannot contain characters that are not \d, or be empty
+        if cl =~ CONTENT_LENGTH_VALUE_INVALID || cl.empty?
+          raise HttpParserError, "Invalid Content-Length: #{cl.inspect}"
+        end
+      else
         @buffer = body.empty? ? nil : body
         @body = EmptyBody
         set_ready
@@ -427,6 +468,7 @@ module Puma
       @chunked_body = true
       @partial_part_left = 0
       @prev_chunk = ""
+      @excess_cr = 0
 
       @body = Tempfile.new(Const::PUMA_TMP_BASE)
       @body.unlink
@@ -477,23 +519,49 @@ module Puma
 
       while !io.eof?
         line = io.gets
-        if line.end_with?("\r\n")
-          len = line.strip.to_i(16)
+        if line.end_with?(CHUNK_VALID_ENDING)
+          # Puma doesn't process chunk extensions, but should parse if they're
+          # present, which is the reason for the semicolon regex
+          chunk_hex = line.strip[/\A[^;]+/]
+          if chunk_hex =~ CHUNK_SIZE_INVALID
+            raise HttpParserError, "Invalid chunk size: '#{chunk_hex}'"
+          end
+          len = chunk_hex.to_i(16)
           if len == 0
             @in_last_chunk = true
             @body.rewind
             rest = io.read
-            last_crlf_size = "\r\n".bytesize
-            if rest.bytesize < last_crlf_size
+            if rest.bytesize < CHUNK_VALID_ENDING_SIZE
               @buffer = nil
-              @partial_part_left = last_crlf_size - rest.bytesize
+              @partial_part_left = CHUNK_VALID_ENDING_SIZE - rest.bytesize
               return false
             else
-              @buffer = rest[last_crlf_size..-1]
+              # if the next character is a CRLF, set buffer to everything after that CRLF
+              start_of_rest = if rest.start_with?(CHUNK_VALID_ENDING)
+                CHUNK_VALID_ENDING_SIZE
+              else # we have started a trailer section, which we do not support. skip it!
+                rest.index(CHUNK_VALID_ENDING*2) + CHUNK_VALID_ENDING_SIZE*2
+              end
+
+              @buffer = rest[start_of_rest..-1]
               @buffer = nil if @buffer.empty?
               set_ready
               return true
             end
+          end
+
+          # Track the excess as a function of the size of the
+          # header vs the size of the actual data. Excess can
+          # go negative (and is expected to) when the body is
+          # significant.
+          # The additional of chunk_hex.size and 2 compensates
+          # for a client sending 1 byte in a chunked body over
+          # a long period of time, making sure that that client
+          # isn't accidentally eventually punished.
+          @excess_cr += (line.size - len - chunk_hex.size - 2)
+
+          if @excess_cr >= MAX_CHUNK_EXCESS
+            raise HttpParserError, "Maximum chunk excess detected"
           end
 
           len += 2
@@ -509,7 +577,12 @@ module Puma
 
           case
           when got == len
-            write_chunk(part[0..-3]) # to skip the ending \r\n
+            # proper chunked segment must end with "\r\n"
+            if part.end_with? CHUNK_VALID_ENDING
+              write_chunk(part[0..-3]) # to skip the ending \r\n
+            else
+              raise HttpParserError, "Chunk size mismatch"
+            end
           when got <= len - 2
             write_chunk(part)
             @partial_part_left = len - part.size
@@ -518,6 +591,10 @@ module Puma
             @partial_part_left = len - part.size
           end
         else
+          if @prev_chunk.size + chunk.size >= MAX_CHUNK_HEADER_SIZE
+            raise HttpParserError, "maximum size of chunk header exceeded"
+          end
+
           @prev_chunk = line
           return false
         end
